@@ -149,24 +149,16 @@
                  }
              );
 
-            var waitTask = Task.Factory.StartNew(
-                () =>
-                {
-                    try
-                    {
-                        consumer.Completion.Wait();
-                    }
-                    catch (AggregateException ex)
-                    {
-                        cts.Cancel();
-                        console.WriteLine(ex.InnerException.Message).ConfigureAwait(false);
-                    }
-                }
-            );
 
-            await waitTask;
-
-
+            try
+            {
+                await consumer.Completion;
+            }
+            catch (Exception ex)
+            {
+                cts.Cancel();
+                await console.WriteLine($"failed to send data records for {typeName}").ConfigureAwait(false);
+            }
         }
 
 
