@@ -16,9 +16,9 @@
 
     class Program
     {
-        private static async Task ReadData<T>(ICollection<string> pathList, Func<string,string, T> factory,
+        private static async Task ReadData<T>(ICollection<string> pathList, Func<string, string, T> factory,
             ObjectPool<EventHubClient> pool, int randomSeed, AsyncConsole console,
-            CancellationToken cancellationToken, int waittime, DataFormat dataFormat)
+            CancellationToken cancellationToken, int waittime, DataFormat dataFormat, CancellationTokenSource cts)
             where T : TaxiData
         {
 
@@ -84,45 +84,89 @@
 
             long messages = 0;
 
-            // iterate through the path list and act on each file from here on
-            foreach (var path in pathList)
-            {
-                ZipArchive archive = new ZipArchive(
-                    File.OpenRead(path),
-                    ZipArchiveMode.Read);
 
-                foreach (var entry in archive.Entries)
+            var readTask = Task.Factory.StartNew(
+                 async () =>
+                 {
+
+                     var shouldStop = false;
+                     // iterate through the path list and act on each file from here on
+                     foreach (var path in pathList)
+                     {
+                         ZipArchive archive = new ZipArchive(
+                             File.OpenRead(path),
+                             ZipArchiveMode.Read);
+
+                         foreach (var entry in archive.Entries)
+                         {
+                             using (var reader = new StreamReader(entry.Open()))
+                             {
+
+                                 var header = reader.ReadLines()
+                                     .First();
+                                 // Start consumer
+                                 var lines = reader.ReadLines()
+                                      .Skip(1);
+
+
+                                 // for each line , send to event hub
+                                 foreach (var line in lines)
+                                 {
+                                     if (!cts.IsCancellationRequested)
+                                     {
+                                         await buffer.SendAsync(factory(line, header)).ConfigureAwait(false);
+                                         if (++messages % 10000 == 0)
+                                         {
+                                             // random delay every 10000 messages are buffered ??
+                                             await Task.Delay(random.Next(100, 1000))
+                                                  .ConfigureAwait(false);
+                                             await console.WriteLine($"Created {messages} records for {typeName}").ConfigureAwait(false);
+                                         }
+                                     }
+                                     else
+                                     {
+                                         shouldStop = !shouldStop;
+                                         break;
+                                     }
+                                 }
+                             }
+
+                             if (shouldStop)
+                             {
+                                 break;
+                             }
+                         }
+
+                         if (shouldStop)
+                         {
+                             break;
+                         }
+                     }
+
+                     buffer.Complete();
+                     await Task.WhenAll(buffer.Completion, consumer.Completion);
+                     await console.WriteLine($"Created total {messages} records for {typeName}").ConfigureAwait(false);
+                 }
+             );
+
+            var waitTask = Task.Factory.StartNew(
+                () =>
                 {
-                    using (var reader = new StreamReader(entry.Open()))
+                    try
                     {
-
-                        var header = reader.ReadLines()
-                            .First();
-                        // Start consumer
-                        var lines = reader.ReadLines()
-                             .Skip(1);
-
-
-                        // for each line , send to event hub
-                        foreach (var line in lines)
-                        {
-
-                            await buffer.SendAsync(factory(line,header)).ConfigureAwait(false);
-                            if (++messages % 10000 == 0)
-                            {
-                                // random delay every 10000 messages are buffered ??
-                                await Task.Delay(random.Next(100, 1000))
-                                    .ConfigureAwait(false);
-                                await console.WriteLine($"Created {messages} records for {typeName}").ConfigureAwait(false);
-                            }
-                        }
+                        consumer.Completion.Wait();
+                    }
+                    catch (AggregateException ex)
+                    {
+                        cts.Cancel();
+                        console.WriteLine(ex.InnerException.Message).ConfigureAwait(false);
                     }
                 }
-            }
+            );
 
-            buffer.Complete();
-            await Task.WhenAll(buffer.Completion, consumer.Completion);
-            await console.WriteLine($"Created total {messages} records for {typeName}").ConfigureAwait(false);
+            await waitTask;
+
+
         }
 
 
@@ -142,6 +186,9 @@
             var numberOfMillisecondsToLead = (int.TryParse(Environment.GetEnvironmentVariable("MINUTES_TO_LEAD"), out int outputMinutesToLead) ? outputMinutesToLead : 0) * 60000;
             var pushRideDataFirst = bool.TryParse(Environment.GetEnvironmentVariable("PUSH_RIDE_DATA_FIRST"), out Boolean outputPushRideDataFirst) ? outputPushRideDataFirst : false;
 
+            rideConnectionString = "Endpoint=sb://asafinalruncosmosdatabaseeventhub.servicebus.windows.net/;SharedAccessKeyName=taxi-ride-asa-access-policy;SharedAccessKey=+RmZNmhKdEuHQo8E8Niju54XiN/LFeKjHuiGx43c0aQ=;EntityPath=taxi-ride";
+            fareConnectionString = "Endpoint=sb://asafinalruncosmosdatabaseeventhub.servicebus.windows.net/;SharedAccessKeyName=taxi-fare-asa-access-policy;SharedAccessKey=BvFCHLegnzKM6FRWoJFm227DM0vSNoIMXDaoxj+qPwU=;EntityPath=taxi-fare";
+            rideDataFilePath = "D:\\reference-architectures\\data\\streaming_asa\\onperm\\DataFile";
             if (string.IsNullOrWhiteSpace(rideConnectionString))
             {
                 throw new ArgumentException("rideConnectionString must be provided");
@@ -289,11 +336,11 @@
 
                 var rideTask = ReadData<TaxiRide>(arguments.RideDataFiles,
                                         TaxiRide.FromString, rideClientPool, 100, console, cts.Token,
-                                        rideTaskWaitTime, DataFormat.Json);
+                                        rideTaskWaitTime, DataFormat.Json, cts);
 
                 var fareTask = ReadData<TaxiFare>(arguments.TripDataFiles,
                     TaxiFare.FromString, fareClientPool, 200, console, cts.Token,
-                    fareTaskWaitTime, DataFormat.Csv);
+                    fareTaskWaitTime, DataFormat.Csv, cts);
 
 
                 await Task.WhenAll(rideTask, fareTask, console.WriterTask);
@@ -309,5 +356,9 @@
         }
     }
 }
+
+
+
+
 
 
